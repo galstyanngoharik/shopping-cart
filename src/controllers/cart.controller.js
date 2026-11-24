@@ -12,16 +12,20 @@ const createCart = asyncHandler(async (req, res) => {
 });
 
 const getCart = asyncHandler(async (req, res) => {
-    const cart = await cartService.getCart(req.params.id);
+    const { items, subtotal, discount, total, promo_code } =
+        await cartService.getCart(req.params.id);
 
     res.status(200).json({
-        success: true,
-        data: cart
+        items,
+        subtotal,
+        discount,
+        total,
+        promo_code
     });
 });
 
 const setItemQuantity = asyncHandler(async (req, res) => {
-    const { product_id, quantity } = req.body;
+    const { product_id, quantity } = req.body ?? {};
 
     const cart = await cartService.setItemQuantity(
         req.params.id,
@@ -38,7 +42,7 @@ const setItemQuantity = asyncHandler(async (req, res) => {
 const applyPromo = asyncHandler(async (req, res) => {
     const cart = await cartService.applyPromo(
         req.params.id,
-        req.body.code
+        req.body?.code
     );
 
     res.status(200).json({

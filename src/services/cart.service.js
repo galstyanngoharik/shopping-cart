@@ -1,6 +1,6 @@
 
-
 const {
+    sequelize,
     Cart,
     CartItem,
     Product,
@@ -14,19 +14,49 @@ const createCart = async () => {
     return Cart.create();
 };
 
-const getCart = async (id) => {
-    const cart = await Cart.findByPk(id, {
+const loadCartWithItems = async (cartId, transaction) => {
+    const cart = await Cart.findByPk(cartId, {
         include: [{
             model: CartItem,
             include: [Product]
-        }]
+        }],
+        transaction
     });
 
     if (!cart) {
         throw new AppError('Cart not found', 404);
     }
 
-    return calculatePricing(cart);
+    return cart;
+};
+
+const lockCart = async (cartId, transaction) => {
+    const cart = await Cart.findByPk(cartId, {
+        transaction,
+        lock: transaction.LOCK.UPDATE
+    });
+
+    if (!cart) {
+        throw new AppError('Cart not found', 404);
+    }
+
+    return cart;
+};
+
+const validatePromo = (pricing) => {
+    if (pricing.promoStatus === 'invalid_code') {
+        throw new AppError('Promo code not found', 404);
+    }
+
+    if (pricing.promoStatus !== 'valid') {
+        throw new AppError(pricing.promoStatus, 400);
+    }
+};
+
+const getCart = async (cartId, transaction) => {
+    const cart = await loadCartWithItems(cartId, transaction);
+
+    return calculatePricing(cart, { transaction });
 };
 
 const setItemQuantity = async (cartId, productId, quantity) => {
@@ -34,144 +64,138 @@ const setItemQuantity = async (cartId, productId, quantity) => {
         throw new AppError('Invalid quantity', 400);
     }
 
-    const cart = await Cart.findByPk(cartId);
+    return sequelize.transaction(async (transaction) => {
+        await lockCart(cartId, transaction);
 
-    if (!cart) {
-        throw new AppError('Cart not found', 404);
-    }
+        const product = await Product.findByPk(productId, {
+            transaction,
+            lock: transaction.LOCK.UPDATE
+        });
 
-    const product = await Product.findByPk(productId);
+        if (!product) {
+            throw new AppError('Product not found', 404);
+        }
 
-    if (!product) {
-        throw new AppError('Product not found', 404);
-    }
+        if (quantity > product.stock) {
+            throw new AppError('Insufficient stock', 400);
+        }
 
-    if (quantity > product.stock) {
-        throw new AppError('Insufficient stock', 400);
-    }
-
-    const item = await CartItem.findOne({
-        where: {
+        const where = {
             cart_id: cartId,
             product_id: productId
+        };
+
+        if (quantity === 0) {
+            await CartItem.destroy({ where, transaction });
+        } else {
+            const item = await CartItem.findOne({ where, transaction });
+
+            if (item) {
+                await item.update({ quantity }, { transaction });
+            } else {
+                await CartItem.create({
+                    ...where,
+                    quantity
+                }, { transaction });
+            }
         }
+
+        return getCart(cartId, transaction);
     });
-
-    if (quantity === 0) {
-        if (item) {
-            await item.destroy();
-        }
-    } else if (item) {
-        await item.update({ quantity });
-    } else {
-        await CartItem.create({
-            cart_id: cartId,
-            product_id: productId,
-            quantity
-        });
-    }
-
-    return getCart(cartId);
 };
 
 const applyPromo = async (cartId, code) => {
-    const cart = await Cart.findByPk(cartId, {
-        include: [{
-            model: CartItem,
-            include: [Product]
-        }]
-    });
-
-    if (!cart) {
-        throw new AppError('Cart not found', 404);
-    }
-
     if (typeof code !== 'string' || !code.trim()) {
         throw new AppError('Invalid promo code', 400);
     }
 
-    const promo = await PromoCode.findByPk(code);
+    return sequelize.transaction(async (transaction) => {
+        await lockCart(cartId, transaction);
+        const cart = await loadCartWithItems(cartId, transaction);
 
-    if (!promo) {
-        throw new AppError('Promo code not found', 404);
-    }
+        cart.promo_code = code.trim();
 
-    cart.promo_code = code;
+        const pricing = await calculatePricing(cart, {
+            transaction,
+            lockPromo: true
+        });
 
-    const pricing = await calculatePricing(cart);
+        validatePromo(pricing);
 
-    if (pricing.promoStatus !== 'valid') {
-        throw new AppError(pricing.promoStatus, 400);
-    }
+        await cart.save({ transaction });
 
-    await cart.save();
-
-    return getCart(cartId);
+        return pricing;
+    });
 };
 
 const removePromo = async (cartId) => {
-    const cart = await Cart.findByPk(cartId);
+    return sequelize.transaction(async (transaction) => {
+        const cart = await lockCart(cartId, transaction);
 
-    if (!cart) {
-        throw new AppError('Cart not found', 404);
-    }
+        await cart.update({ promo_code: null }, { transaction });
 
-    await cart.update({ promo_code: null });
-
-    return getCart(cartId);
+        return getCart(cartId, transaction);
+    });
 };
 
 const checkout = async (cartId) => {
-    const cart = await Cart.findByPk(cartId, {
-        include: [{
-            model: CartItem,
-            include: [Product]
-        }]
-    });
+    return sequelize.transaction(async (transaction) => {
+        await lockCart(cartId, transaction);
+        const cart = await loadCartWithItems(cartId, transaction);
 
-    if (!cart) {
-        throw new AppError('Cart not found', 404);
-    }
-
-    if (cart.CartItems.length === 0) {
-        throw new AppError('Cart is empty', 400);
-    }
-
-    for (const item of cart.CartItems) {
-        const product = await Product.findByPk(item.product_id);
-
-        if (!product || item.quantity > product.stock) {
-            throw new AppError('Insufficient stock', 409);
+        if (cart.CartItems.length === 0) {
+            throw new AppError('Cart is empty', 400);
         }
-    }
 
-    const pricing = await calculatePricing(cart);
+        const sortedItems = [...cart.CartItems].sort(
+            (first, second) => first.product_id - second.product_id
+        );
 
-    if (cart.promo_code && pricing.promoStatus !== 'valid') {
-        throw new AppError(pricing.promoStatus, 400);
-    }
+        for (const item of sortedItems) {
+            const product = await Product.findByPk(item.product_id, {
+                transaction,
+                lock: transaction.LOCK.UPDATE
+            });
 
-    for (const item of cart.CartItems) {
-        await Product.decrement('stock', {
-            by: item.quantity,
-            where: { id: item.product_id }
+            if (!product) {
+                throw new AppError('Product not found', 404);
+            }
+
+            if (item.quantity > product.stock) {
+                throw new AppError('Insufficient stock', 409);
+            }
+
+            await product.update({
+                stock: product.stock - item.quantity
+            }, { transaction });
+
+            item.Product = product;
+        }
+
+        const pricing = await calculatePricing(cart, {
+            transaction,
+            lockPromo: true
         });
-    }
 
-    if (cart.promo_code) {
-        await PromoCode.increment('times_used', {
-            by: 1,
-            where: { code: cart.promo_code }
+        if (cart.promo_code) {
+            validatePromo(pricing);
+
+            await PromoCode.increment('times_used', {
+                by: 1,
+                where: { code: cart.promo_code },
+                transaction
+            });
+        }
+
+        await CartItem.destroy({
+            where: { cart_id: cartId },
+            transaction
         });
-    }
 
-    await CartItem.destroy({
-        where: { cart_id: cartId }
+        await cart.update({ promo_code: null }, { transaction });
+
+        return pricing;
     });
-
-    await cart.update({ promo_code: null });
-
-    return pricing;
 };
 
 module.exports = {

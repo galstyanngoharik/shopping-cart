@@ -1,17 +1,24 @@
 
 
+
 const { PromoCode } = require('../models');
 
-const calculatePricing = async (cart) => {
-    const subtotal = cart.CartItems.reduce((sum, item) => {
-        return sum + item.quantity * item.Product.price;
-    }, 0);
+const calculatePricing = async (cart, options = {}) => {
+    const subtotal = cart.CartItems.reduce(
+        (sum, item) => sum + item.quantity * item.Product.price,
+        0
+    );
 
     let discount = 0;
     let promoStatus = null;
 
     if (cart.promo_code) {
-        const promo = await PromoCode.findByPk(cart.promo_code);
+        const promo = await PromoCode.findByPk(cart.promo_code, {
+            transaction: options.transaction,
+            ...(options.lockPromo && options.transaction
+                ? { lock: options.transaction.LOCK.UPDATE }
+                : {})
+        });
 
         if (!promo) {
             promoStatus = 'invalid_code';
@@ -25,7 +32,9 @@ const calculatePricing = async (cart) => {
             promoStatus = 'valid';
 
             if (promo.type === 'percentage') {
-                discount = Math.floor(subtotal * promo.value / 100);
+                discount = Math.floor(
+                    subtotal * promo.value / 100
+                );
             } else {
                 discount = promo.value;
             }
@@ -47,6 +56,4 @@ const calculatePricing = async (cart) => {
     };
 };
 
-module.exports = {
-    calculatePricing
-};
+module.exports = { calculatePricing };
